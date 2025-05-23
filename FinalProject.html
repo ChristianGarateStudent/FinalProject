@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Final Project</title>
+    <script src="gl-matrix.js"></script>
+    <style>
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        background-color: #333;
+        overflow: hidden;
+      }
+      canvas {
+        border: 1px solid black;
+        margin-bottom: 10px;
+      }
+      .controls {
+        padding: 10px;
+        background-color: #444;
+        border-radius: 5px;
+      }
+      .controls button {
+        margin: 0 5px;
+        padding: 8px 12px;
+        background-color: #555;
+        color: white;
+        border: none;
+        border-radius: 3px;
+        cursor: pointer;
+      }
+      .controls button:hover {
+        background-color: #666;
+      }
+      .controls button.active {
+        background-color: #007bff;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="glCanvas" width="640" height="480"></canvas>
+    <div class="controls">
+      <button id="texturedModeBtn" class="active">Textured</button>
+      <button id="wireframeModeBtn">Wireframe</button>
+      <button id="ssaoDebugBtn">Show SSAO Map</button>
+    </div>
+
+    <script id="vertex-shader" type="x-shader/x-vertex">
+      attribute vec4 aVertexPosition;
+      attribute vec3 aVertexNormal;
+      attribute vec2 aTextureCoord;
+      uniform mat4 uProjectionMatrix;
+      uniform mat4 uViewMatrix;
+      uniform mat4 uModelMatrix;
+      uniform mat4 uNormalMatrix;
+      varying highp vec2 vTextureCoord;
+      varying highp vec3 vNormalWorld;
+      varying highp vec3 vFragPosWorld;
+      void main(void) {
+          vFragPosWorld = (uModelMatrix * aVertexPosition).xyz;
+          vNormalWorld = normalize((uNormalMatrix * vec4(aVertexNormal, 0.0)).xyz);
+          vTextureCoord = aTextureCoord;
+          gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * aVertexPosition;
+      }
+    </script>
+    <script id="fragment-shader" type="x-shader/x-fragment">
+      precision mediump float;
+      varying highp vec2 vTextureCoord;
+      varying highp vec3 vNormalWorld;
+      varying highp vec3 vFragPosWorld;
+      uniform sampler2D uSampler;
+      uniform vec3 uCameraPositionWorld;
+      uniform vec3 uLightDirectionWorld;
+      uniform vec3 uLightColor;
+      uniform vec3 uAmbientColor;
+      uniform vec3 uSpecularColor;
+      uniform float uShininess;
+      uniform bool uWireframe;
+      uniform sampler2D uSsaoBlurTexture;
+      uniform bool uShowSsaoDebug;
+
+      const float SSAO_TEXTURE_DIM_WIDTH = 640.0;
+      const float SSAO_TEXTURE_DIM_HEIGHT = 480.0;
+
+      void main(void) {
+          if (uWireframe) {
+              gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);
+          } else {
+              highp vec4 texelColor = texture2D(uSampler, vTextureCoord);
+              vec3 normal = normalize(vNormalWorld);
+              vec3 lightDir = normalize(-uLightDirectionWorld);
+              vec3 viewDir = normalize(uCameraPositionWorld - vFragPosWorld);
+
+              float occlusion = texture2D(uSsaoBlurTexture, gl_FragCoord.xy / vec2(SSAO_TEXTURE_DIM_WIDTH, SSAO_TEXTURE_DIM_HEIGHT)).r;
+              // occlusion = 1.0; // Uncomment to disable SSAO darkening for testing
+
+              vec3 ambient = uAmbientColor * texelColor.rgb * occlusion;
+
+              float diff = max(dot(normal, lightDir), 0.0);
+              vec3 diffuse = diff * uLightColor * texelColor.rgb;
+              vec3 reflectDir = reflect(-lightDir, normal);
+              float spec = pow(max(dot(viewDir, reflectDir), 0.0), uShininess);
+              vec3 specular = spec * uLightColor * uSpecularColor;
+
+              vec3 result = ambient + diffuse + specular;
+
+              if (uShowSsaoDebug) {
+                gl_FragColor = vec4(vec3(occlusion), 1.0);
+              } else {
+                gl_FragColor = vec4(result, texelColor.a);
+              }
+          }
+      }
+    </script>
+
+    <script id="gbuffer-vertex-shader" type="x-shader/x-vertex">
+      attribute vec4 aVertexPosition;
+      attribute vec3 aVertexNormal;
+      uniform mat4 uModelMatrix;
+      uniform mat4 uViewMatrix;
+      uniform mat4 uProjectionMatrix;
+      uniform mat4 uNormalMatrix;
+      varying highp vec3 vViewPosition;
+      varying highp vec3 vViewNormal;
+      void main(void) {
+          vec4 worldPosition = uModelMatrix * aVertexPosition;
+          vec4 viewPosition = uViewMatrix * worldPosition;
+          vViewPosition = viewPosition.xyz;
+          vec3 worldNormal = normalize((uNormalMatrix * vec4(aVertexNormal, 0.0)).xyz);
+          vViewNormal = normalize(mat3(uViewMatrix) * worldNormal);
+          gl_Position = uProjectionMatrix * viewPosition;
+      }
+    </script>
+    <script id="gbuffer-fragment-shader" type="x-shader/x-fragment">
+      precision mediump float;
+      varying highp vec3 vViewPosition;
+      varying highp vec3 vViewNormal;
+      void main(void) {
+          vec3 normalMapped = normalize(vViewNormal) * 0.5 + 0.5;
+          gl_FragColor = vec4(normalMapped, clamp(-vViewPosition.z / 2000.0, 0.0, 1.0) );
+      }
+    </script>
+
+    <script id="ssao-vertex-shader" type="x-shader/x-vertex">
+      attribute vec2 aPosition;
+      varying highp vec2 vTexCoord;
+      void main() {
+          vTexCoord = aPosition * 0.5 + 0.5;
+          gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    </script>
+    <script id="ssao-fragment-shader" type="x-shader/x-fragment">
+      precision mediump float;
+      varying highp vec2 vTexCoord;
+      uniform sampler2D uGDepth; // Not directly used if depth is in uGNormal.a
+      uniform sampler2D uGNormal;
+      uniform mat4 uProjectionMatrix;
+      uniform vec3 uKernel[64];
+      uniform sampler2D uNoiseTexture;
+      uniform vec2 uScreenSize;
+      const int KERNEL_SIZE = 64;
+      const float RADIUS = 0.2;
+      const float BIAS = 0.01;    // Small bias
+      const float FAR_PLANE = 2000.0;
+      vec3 reconstructViewPosFromDepth(vec2 uv, float depthPacked) {
+          float viewZ = -depthPacked * FAR_PLANE;
+          vec2 ndc = uv * 2.0 - 1.0;
+          float x = ndc.x * viewZ * (1.0 / -uProjectionMatrix[0][0]);
+          float y = ndc.y * viewZ * (1.0 / -uProjectionMatrix[1][1]);
+          return vec3(x, y, viewZ);
+      }
+      void main() {
+          vec4 gSample = texture2D(uGNormal, vTexCoord);
+          vec3 fragNormalView = normalize(gSample.rgb * 2.0 - 1.0);
+          float fragDepthPacked = gSample.a;
+          vec3 fragPosView = reconstructViewPosFromDepth(vTexCoord, fragDepthPacked);
+          vec2 noiseTexCoord = vTexCoord * uScreenSize / 4.0;
+          vec3 randomVec = normalize(texture2D(uNoiseTexture, noiseTexCoord).rgb * 2.0 - 1.0);
+          float occlusion = 0.0;
+          for (int i = 0; i < KERNEL_SIZE; ++i) {
+              vec3 samplePointKernel = uKernel[i];
+              vec3 tangent = normalize(randomVec - fragNormalView * dot(randomVec, fragNormalView));
+              vec3 bitangent = cross(fragNormalView, tangent);
+              mat3 tbn = mat3(tangent, bitangent, fragNormalView);
+              vec3 samplePointView = tbn * samplePointKernel;
+              samplePointView = fragPosView + samplePointView * RADIUS;
+              vec4 offset = vec4(samplePointView, 1.0);
+              offset = uProjectionMatrix * offset;
+              offset.xyz /= offset.w;
+              offset.xyz = offset.xyz * 0.5 + 0.5;
+              if (offset.x < 0.0 || offset.x > 1.0 || offset.y < 0.0 || offset.y > 1.0) { continue; }
+              float sampleDepthPacked = texture2D(uGNormal, offset.xy).a;
+              float sampleDepthView = -sampleDepthPacked * FAR_PLANE;
+              float rangeCheck = smoothstep(0.0, 1.0, RADIUS / abs(fragPosView.z - sampleDepthView));
+              if (samplePointView.z >= sampleDepthView + BIAS) { occlusion += 1.0 * rangeCheck; }
+          }
+          occlusion = 1.0 - (occlusion / float(KERNEL_SIZE));
+          gl_FragColor = vec4(occlusion, occlusion, occlusion, 1.0);
+      }
+    </script>
+
+    <script id="ssao-blur-vertex-shader" type="x-shader/x-vertex">
+      attribute vec2 aPosition;
+      varying highp vec2 vTexCoord;
+      void main() {
+          vTexCoord = aPosition * 0.5 + 0.5;
+          gl_Position = vec4(aPosition, 0.0, 1.0);
+      }
+    </script>
+    <script id="ssao-blur-fragment-shader" type="x-shader/x-fragment">
+      precision mediump float;
+      varying highp vec2 vTexCoord;
+      uniform sampler2D uSsaoInput;
+      uniform vec2 uTexelSize;
+      void main() {
+          float result = 0.0;
+          for (int x = -1; x <= 1; ++x) {
+              for (int y = -1; y <= 1; ++y) {
+                  result += texture2D(uSsaoInput, vTexCoord + vec2(float(x), float(y)) * uTexelSize).r;
+              }
+          }
+          result /= 9.0;
+          gl_FragColor = vec4(result, result, result, 1.0);
+      }
+    </script>
+
+    <script>
+      let currentRenderMode = "textured";
+      let showSsaoDebug = false;
+      let gBufferFBO = null;
+      let gBufferNormalTexture = null;
+      let gBufferDepthTexture = null;
+      let gBufferProgramInfo = null;
+      const GBUFFER_WIDTH = 640;
+      const GBUFFER_HEIGHT = 480;
+      let ssaoFBO = null;
+      let ssaoTexture = null;
+      let ssaoProgramInfo = null;
+      let ssaoKernel = [];
+      let ssaoNoiseTexture = null;
+      let quadVBO = null;
+      let ssaoBlurFBO = null;
+      let ssaoBlurTexture = null;
+      let ssaoBlurProgramInfo = null;
+      let objectRotation = 0.0;
+      let then = 0;
+      let frameCount = 0;
+      let cameraAngleX = 0;
+      let cameraAngleY = 0.2;
+      let cameraDistance = 15;
+      let isDragging = false;
+      let lastMouseX = 0;
+      let lastMouseY = 0;
+      let cameraPosition = [0, 0, 0];
+      let couchTexture = null;
+      let couchModelData = null;
+      let couchBuffers = null;
+      let aircraftTexture = null;
+      let aircraftData = null;
+      let aircraftBuffers = null;
+      let guitarTexture = null;
+      let guitarData = null;
+      let guitarBuffers = null;
+      let groundTexture = null;
+      let groundBuffers = null;
+
+      function loadTexture(gl, url) {
+        const t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          1,
+          1,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          new Uint8Array([0, 0, 255, 255])
+        );
+        const i = new Image();
+        i.onload = () => {
+          gl.bindTexture(gl.TEXTURE_2D, t);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            i
+          );
+          if (isPowerOf2(i.width) && isPowerOf2(i.height)) {
+            gl.generateMipmap(gl.TEXTURE_2D);
+          } else {
+            gl.texParameteri(
+              gl.TEXTURE_2D,
+              gl.TEXTURE_WRAP_S,
+              gl.CLAMP_TO_EDGE
+            );
+            gl.texParameteri(
+              gl.TEXTURE_2D,
+              gl.TEXTURE_WRAP_T,
+              gl.CLAMP_TO_EDGE
+            );
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          }
+          console.log("Tex loaded:", url);
+        };
+        i.onerror = () => {
+          console.error("Err tex:", url);
+        };
+        i.src = url;
+        return t;
+      }
+      function isPowerOf2(v) {
+        return (v & (v - 1)) == 0;
+      }
+      async function loadOBJ(url) {
+        console.log("loadOBJ:", url);
+        console.log("Fetch:", url);
+        const r = await fetch(url);
+        if (!r.ok) {
+          throw new Error(`HTTP err ${r.status} @ ${url}`);
+        }
+        const t = await r.text();
+        console.log("Fetched text:", url, `Len:${t.length}`);
+        return parseOBJ(t);
+      }
+      function parseOBJ(t) {
+        console.log("parseOBJ len:", t.length);
+        const p = [],
+          n = [],
+          x = [];
+        const op = [],
+          on = [],
+          ox = [];
+        const l = t.split("\n");
+        for (const i of l) {
+          const ti = i.trim();
+          if (ti.startsWith("v ")) {
+            const ps = ti.split(/\s+/);
+            p.push(parseFloat(ps[1]), parseFloat(ps[2]), parseFloat(ps[3]));
+          } else if (ti.startsWith("vn ")) {
+            const ps = ti.split(/\s+/);
+            n.push(parseFloat(ps[1]), parseFloat(ps[2]), parseFloat(ps[3]));
+          } else if (ti.startsWith("vt ")) {
+            const ps = ti.split(/\s+/);
+            x.push(parseFloat(ps[1]), 1.0 - parseFloat(ps[2]));
+          } else if (ti.startsWith("f ")) {
+            const fd = [];
+            const ps = ti.split(/\s+/).slice(1);
+            for (let k = 0; k < ps.length; k++) {
+              const is = ps[k].split("/");
+              fd.push({
+                vI: parseInt(is[0]) - 1,
+                vtI: is.length > 1 && is[1] ? parseInt(is[1]) - 1 : -1,
+                vnI: is.length > 2 && is[2] ? parseInt(is[2]) - 1 : -1,
+              });
+            }
+            for (let k = 1; k < fd.length - 1; ++k) {
+              const tr = [fd[0], fd[k], fd[k + 1]];
+              tr.forEach((d) => {
+                if (d.vI * 3 + 2 >= p.length) {
+                  console.warn("Inv v idx:", d.vI + 1);
+                  return;
+                }
+                op.push(p[d.vI * 3], p[d.vI * 3 + 1], p[d.vI * 3 + 2]);
+                if (d.vnI !== -1 && d.vnI * 3 + 2 < n.length) {
+                  on.push(n[d.vnI * 3], n[d.vnI * 3 + 1], n[d.vnI * 3 + 2]);
+                } else {
+                  on.push(0, 1, 0);
+                }
+                if (d.vtI !== -1 && d.vtI * 2 + 1 < x.length) {
+                  ox.push(x[d.vtI * 2], x[d.vtI * 2 + 1]);
+                } else {
+                  ox.push(0, 0);
+                }
+              });
+            }
+          }
+        }
+        console.log(
+          "parseOBJ done.Pos:",
+          op.length / 3,
+          "Norm:",
+          on.length / 3,
+          "TexC:",
+          ox.length / 2
+        );
+        return { positions: op, normals: on, texcoords: ox };
+      }
+      function initGBuffer(gl) {
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gBufferNormalTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, gBufferNormalTexture);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          GBUFFER_WIDTH,
+          GBUFFER_HEIGHT,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          gBufferNormalTexture,
+          0
+        );
+        if (gl instanceof WebGL2RenderingContext) {
+          gBufferDepthTexture = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, gBufferDepthTexture);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.DEPTH_COMPONENT24,
+            GBUFFER_WIDTH,
+            GBUFFER_HEIGHT,
+            0,
+            gl.DEPTH_COMPONENT,
+            gl.UNSIGNED_INT,
+            null
+          );
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.framebufferTexture2D(
+            gl.FRAMEBUFFER,
+            gl.DEPTH_ATTACHMENT,
+            gl.TEXTURE_2D,
+            gBufferDepthTexture,
+            0
+          );
+          console.log("Using WebGL2 depth texture with DEPTH_COMPONENT24.");
+        } else {
+          console.warn(
+            "WebGL2 not supported. Using renderbuffer for depth. SSAO may need adjustments."
+          );
+          const depthRenderbuffer = gl.createRenderbuffer();
+          gl.bindRenderbuffer(gl.RENDERBUFFER, depthRenderbuffer);
+          gl.renderbufferStorage(
+            gl.RENDERBUFFER,
+            gl.DEPTH_COMPONENT16,
+            GBUFFER_WIDTH,
+            GBUFFER_HEIGHT
+          );
+          gl.framebufferRenderbuffer(
+            gl.FRAMEBUFFER,
+            gl.DEPTH_ATTACHMENT,
+            gl.RENDERBUFFER,
+            depthRenderbuffer
+          );
+        }
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+          console.error(
+            "G-Buffer framebuffer is incomplete: 0x" + status.toString(16)
+          );
+          return null;
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return fbo;
+      }
+      function initSsaoFBO(gl) {
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        ssaoTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, ssaoTexture);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          GBUFFER_WIDTH,
+          GBUFFER_HEIGHT,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          ssaoTexture,
+          0
+        );
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+          console.error("SSAO FBO incomplete:" + status.toString(16));
+          return null;
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return fbo;
+      }
+      function initSsaoBlurFBO(gl) {
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        ssaoBlurTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, ssaoBlurTexture);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          GBUFFER_WIDTH,
+          GBUFFER_HEIGHT,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          null
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.framebufferTexture2D(
+          gl.FRAMEBUFFER,
+          gl.COLOR_ATTACHMENT0,
+          gl.TEXTURE_2D,
+          ssaoBlurTexture,
+          0
+        );
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+          console.error("SSAO Blur FBO incomplete: " + status.toString(16));
+          return null;
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return fbo;
+      }
+      function generateSsaoKernel() {
+        for (let i = 0; i < 64; ++i) {
+          let s = glMatrix.vec3.fromValues(
+            Math.random() * 2 - 1,
+            Math.random() * 2 - 1,
+            Math.random()
+          );
+          glMatrix.vec3.normalize(s, s);
+          glMatrix.vec3.scale(s, s, Math.random());
+          let sc = parseFloat(i) / 64.0;
+          sc = lerp(0.1, 1.0, sc * sc);
+          glMatrix.vec3.scale(s, s, sc);
+          ssaoKernel.push(s[0], s[1], s[2]);
+        }
+      }
+      function lerp(a, b, f) {
+        return a + f * (b - a);
+      }
+      function generateNoiseTexture(gl) {
+        const nD = [];
+        for (let i = 0; i < 16; i++) {
+          nD.push(Math.random() * 2 - 1, Math.random() * 2 - 1, 0.0, 0.0);
+        }
+        const t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        let iF = gl.RGBA;
+        let ty = gl.UNSIGNED_BYTE;
+        let dt = new Uint8Array(16 * 4);
+        for (let i = 0; i < 16 * 4; i++) {
+          dt[i] = Math.floor((nD[i] * 0.5 + 0.5) * 255);
+        }
+        if (gl instanceof WebGL2RenderingContext) {
+          iF = gl.RGBA32F;
+          ty = gl.FLOAT;
+          dt = new Float32Array(nD);
+          console.log("Using RGBA32F for noise (WebGL2).");
+        } else if (gl.getExtension("EXT_color_buffer_float")) {
+          const e = gl.getExtension("EXT_color_buffer_float");
+          iF = e.RGBA32F_EXT;
+          ty = gl.FLOAT;
+          dt = new Float32Array(nD);
+          console.log("Using RGBA32F_EXT for noise (WebGL1+EXT).");
+        } else {
+          console.warn("Float noise tex n/a, using RGBA8.");
+        }
+        gl.texImage2D(gl.TEXTURE_2D, 0, iF, 4, 4, 0, gl.RGBA, ty, dt);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+        return t;
+      }
+      function initGroundPlaneBuffers(gl) {
+        const positions = [
+          -1.0, 0.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0, 1.0,
+        ];
+        const normals = [
+          0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+        ];
+        const textureCoordinates = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        const indices = [0, 1, 2, 0, 2, 3];
+        const pB = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, pB);
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          new Float32Array(positions),
+          gl.STATIC_DRAW
+        );
+        const nB = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, nB);
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          new Float32Array(normals),
+          gl.STATIC_DRAW
+        );
+        const tCB = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, tCB);
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          new Float32Array(textureCoordinates),
+          gl.STATIC_DRAW
+        );
+        const iB = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, iB);
+        gl.bufferData(
+          gl.ELEMENT_ARRAY_BUFFER,
+          new Uint16Array(indices),
+          gl.STATIC_DRAW
+        );
+        return {
+          position: pB,
+          normal: nB,
+          textureCoord: tCB,
+          indices: iB,
+          vertexCount: indices.length,
+        };
+      }
+
+      async function main() {
+        console.log("main() function started");
+        const canvas = document.querySelector("#glCanvas");
+        const gl = canvas.getContext("webgl2");
+        if (!gl) {
+          console.error("Unable to initialize WebGL2.");
+          return;
+        }
+
+        const texturedModeBtn = document.getElementById("texturedModeBtn");
+        const wireframeModeBtn = document.getElementById("wireframeModeBtn");
+        const ssaoDebugBtn = document.getElementById("ssaoDebugBtn");
+        texturedModeBtn.addEventListener("click", () => {
+          currentRenderMode = "textured";
+          showSsaoDebug = false;
+          updateButtonStates();
+        });
+        wireframeModeBtn.addEventListener("click", () => {
+          currentRenderMode = "wireframe";
+          showSsaoDebug = false;
+          updateButtonStates();
+        });
+        ssaoDebugBtn.addEventListener("click", () => {
+          showSsaoDebug = !showSsaoDebug;
+          updateButtonStates();
+        });
+        function updateButtonStates() {
+          texturedModeBtn.classList.toggle(
+            "active",
+            currentRenderMode === "textured" && !showSsaoDebug
+          );
+          wireframeModeBtn.classList.toggle(
+            "active",
+            currentRenderMode === "wireframe" && !showSsaoDebug
+          );
+          ssaoDebugBtn.classList.toggle("active", showSsaoDebug);
+          console.log("Mode:", currentRenderMode, "SSAO Debug:", showSsaoDebug);
+        }
+        updateButtonStates();
+
+        canvas.addEventListener("mousedown", (e) => {
+          isDragging = true;
+          lastMouseX = e.clientX;
+          lastMouseY = e.clientY;
+          console.log("MD:", { x: e.clientX, y: e.clientY });
+        });
+        canvas.addEventListener("mouseup", () => {
+          isDragging = false;
+          console.log("MU");
+        });
+        canvas.addEventListener("mouseout", () => {
+          isDragging = false;
+          console.log("MO");
+        });
+        canvas.addEventListener("mousemove", (e) => {
+          if (!isDragging) return;
+          const dX = e.clientX - lastMouseX;
+          const dY = e.clientY - lastMouseY;
+          cameraAngleX += dX * 0.05;
+          cameraAngleY += dY * 0.05;
+          cameraAngleY = Math.max(
+            -Math.PI / 2 + 0.01,
+            Math.min(Math.PI / 2 - 0.01, cameraAngleY)
+          );
+          lastMouseX = e.clientX;
+          lastMouseY = e.clientY;
+        });
+        canvas.addEventListener("wheel", (e) => {
+          e.preventDefault();
+          cameraDistance += e.deltaY * 0.03;
+          cameraDistance = Math.max(0.1, Math.min(200.0, cameraDistance));
+          console.log("Wheel D:", e.deltaY, "Dist:", cameraDistance.toFixed(2));
+        });
+
+        gBufferFBO = initGBuffer(gl);
+        if (!gBufferFBO) {
+          console.error("G-Buffer FBO init failed.");
+        }
+        ssaoFBO = initSsaoFBO(gl);
+        if (!ssaoFBO) {
+          console.error("SSAO FBO init failed.");
+        }
+        ssaoBlurFBO = initSsaoBlurFBO(gl);
+        if (!ssaoBlurFBO) {
+          console.error("SSAO Blur FBO init failed.");
+        }
+
+        generateSsaoKernel();
+        ssaoNoiseTexture = generateNoiseTexture(gl);
+
+        console.log("Attempting to get G-Buffer shader elements from DOM...");
+        const gBufferVsElement = document.getElementById(
+          "gbuffer-vertex-shader"
+        );
+        const gBufferFsElement = document.getElementById(
+          "gbuffer-fragment-shader"
+        );
+        console.log("gbuffer-vertex-shader element:", gBufferVsElement);
+        console.log("gbuffer-fragment-shader element:", gBufferFsElement);
+        if (!gBufferVsElement || !gBufferFsElement) {
+          console.error("G-Buffer shader script tags not found!");
+          return;
+        }
+        const gBufferVS = gBufferVsElement.textContent;
+        const gBufferFS = gBufferFsElement.textContent;
+        const gBufferShaderProgram = initShaderProgram(
+          gl,
+          gBufferVS,
+          gBufferFS
+        );
+        if (!gBufferShaderProgram) {
+          console.error("G-Buffer shader init failed.");
+          return;
+        }
+        gBufferProgramInfo = {
+          program: gBufferShaderProgram,
+          attribLocations: {
+            vertexPosition: gl.getAttribLocation(
+              gBufferShaderProgram,
+              "aVertexPosition"
+            ),
+            vertexNormal: gl.getAttribLocation(
+              gBufferShaderProgram,
+              "aVertexNormal"
+            ),
+          },
+          uniformLocations: {
+            projectionMatrix: gl.getUniformLocation(
+              gBufferShaderProgram,
+              "uProjectionMatrix"
+            ),
+            viewMatrix: gl.getUniformLocation(
+              gBufferShaderProgram,
+              "uViewMatrix"
+            ),
+            modelMatrix: gl.getUniformLocation(
+              gBufferShaderProgram,
+              "uModelMatrix"
+            ),
+            normalMatrix: gl.getUniformLocation(
+              gBufferShaderProgram,
+              "uNormalMatrix"
+            ),
+          },
+        };
+
+        const ssaoVsElement = document.getElementById("ssao-vertex-shader");
+        const ssaoFsElement = document.getElementById("ssao-fragment-shader");
+        if (!ssaoVsElement || !ssaoFsElement) {
+          console.error("SSAO shader script tags not found!");
+          return;
+        }
+        const ssaoVS = ssaoVsElement.textContent;
+        const ssaoFS = ssaoFsElement.textContent;
+        const ssaoShaderProgram = initShaderProgram(gl, ssaoVS, ssaoFS);
+        if (!ssaoShaderProgram) {
+          console.error("SSAO shader init failed.");
+          return;
+        }
+        ssaoProgramInfo = {
+          program: ssaoShaderProgram,
+          attribLocations: {
+            position: gl.getAttribLocation(ssaoShaderProgram, "aPosition"),
+          },
+          uniformLocations: {
+            uGDepth: gl.getUniformLocation(ssaoShaderProgram, "uGDepth"),
+            uGNormal: gl.getUniformLocation(ssaoShaderProgram, "uGNormal"),
+            uProjectionMatrix: gl.getUniformLocation(
+              ssaoShaderProgram,
+              "uProjectionMatrix"
+            ),
+            uKernel: gl.getUniformLocation(ssaoShaderProgram, "uKernel"),
+            uNoiseTexture: gl.getUniformLocation(
+              ssaoShaderProgram,
+              "uNoiseTexture"
+            ),
+            uScreenSize: gl.getUniformLocation(
+              ssaoShaderProgram,
+              "uScreenSize"
+            ),
+          },
+        };
+
+        const ssaoBlurVsElement = document.getElementById(
+          "ssao-blur-vertex-shader"
+        );
+        const ssaoBlurFsElement = document.getElementById(
+          "ssao-blur-fragment-shader"
+        );
+        if (!ssaoBlurVsElement || !ssaoBlurFsElement) {
+          console.error("SSAO Blur shader script tags not found!");
+          return;
+        }
+        const ssaoBlurVS = ssaoBlurVsElement.textContent;
+        const ssaoBlurFS = ssaoBlurFsElement.textContent;
+        const ssaoBlurShaderProgram = initShaderProgram(
+          gl,
+          ssaoBlurVS,
+          ssaoBlurFS
+        );
+        if (!ssaoBlurShaderProgram) {
+          console.error("SSAO Blur shader program init failed.");
+          return;
+        }
+        ssaoBlurProgramInfo = {
+          program: ssaoBlurShaderProgram,
+          attribLocations: {
+            position: gl.getAttribLocation(ssaoBlurShaderProgram, "aPosition"),
+          },
+          uniformLocations: {
+            uSsaoInput: gl.getUniformLocation(
+              ssaoBlurShaderProgram,
+              "uSsaoInput"
+            ),
+            uTexelSize: gl.getUniformLocation(
+              ssaoBlurShaderProgram,
+              "uTexelSize"
+            ),
+          },
+        };
+
+        couchTexture = loadTexture(gl, "couch_texture.jpg");
+        aircraftTexture = loadTexture(gl, "E-45 _col.jpg");
+        guitarTexture = loadTexture(gl, "guitar_wood.jpeg");
+        groundTexture = loadTexture(gl, "ground_texture.jpg");
+
+        const couchMdlUrl = "couch.obj";
+        try {
+          couchModelData = await loadOBJ(couchMdlUrl);
+          if (!couchModelData || couchModelData.positions.length === 0) {
+            console.error(`Fail OBJ:${couchMdlUrl}`);
+            return;
+          }
+        } catch (e) {
+          console.error(`Err OBJ(${couchMdlUrl}):`, e);
+          return;
+        }
+        const aircraftMdlUrl = "E 45 Aircraft.obj";
+        try {
+          aircraftData = await loadOBJ(aircraftMdlUrl);
+          if (!aircraftData || aircraftData.positions.length === 0) {
+            console.warn(`Fail OBJ:${aircraftMdlUrl}`);
+            aircraftData = null;
+          }
+        } catch (e) {
+          console.error(`Err OBJ(${aircraftMdlUrl}):`, e);
+          aircraftData = null;
+        }
+        const guitarMdlUrl = "guitar.obj";
+        try {
+          guitarData = await loadOBJ(guitarMdlUrl);
+          if (!guitarData || guitarData.positions.length === 0) {
+            console.warn(`Fail OBJ:${guitarMdlUrl}`);
+            guitarData = null;
+          }
+        } catch (e) {
+          console.error(`Err OBJ(${guitarMdlUrl}):`, e);
+          guitarData = null;
+        }
+
+        console.log("Attempting to get Main shader elements from DOM...");
+        const vsElement = document.getElementById("vertex-shader");
+        const fsElement = document.getElementById("fragment-shader");
+        console.log("vertex-shader element:", vsElement);
+        console.log("fragment-shader element:", fsElement);
+        if (!vsElement || !fsElement) {
+          console.error("Main shader script tags not found!");
+          return;
+        }
+        const vsSource = vsElement.textContent;
+        const fsSource = fsElement.textContent;
+        const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
+        if (!shaderProgram) {
+          console.error("Main shader init failed.");
+          return;
+        }
+        const programInfo = {
+          program: shaderProgram,
+          attribLocations: {
+            vertexPosition: gl.getAttribLocation(
+              shaderProgram,
+              "aVertexPosition"
+            ),
+            vertexNormal: gl.getAttribLocation(shaderProgram, "aVertexNormal"),
+            textureCoord: gl.getAttribLocation(shaderProgram, "aTextureCoord"),
+          },
+          uniformLocations: {
+            projectionMatrix: gl.getUniformLocation(
+              shaderProgram,
+              "uProjectionMatrix"
+            ),
+            viewMatrix: gl.getUniformLocation(shaderProgram, "uViewMatrix"),
+            modelMatrix: gl.getUniformLocation(shaderProgram, "uModelMatrix"),
+            normalMatrix: gl.getUniformLocation(shaderProgram, "uNormalMatrix"),
+            uSampler: gl.getUniformLocation(shaderProgram, "uSampler"),
+            uCameraPositionWorld: gl.getUniformLocation(
+              shaderProgram,
+              "uCameraPositionWorld"
+            ),
+            uLightDirectionWorld: gl.getUniformLocation(
+              shaderProgram,
+              "uLightDirectionWorld"
+            ),
+            uLightColor: gl.getUniformLocation(shaderProgram, "uLightColor"),
+            uAmbientColor: gl.getUniformLocation(
+              shaderProgram,
+              "uAmbientColor"
+            ),
+            uSpecularColor: gl.getUniformLocation(
+              shaderProgram,
+              "uSpecularColor"
+            ),
+            uShininess: gl.getUniformLocation(shaderProgram, "uShininess"),
+            uWireframe: gl.getUniformLocation(shaderProgram, "uWireframe"),
+            uSsaoTexture: gl.getUniformLocation(
+              shaderProgram,
+              "uSsaoBlurTexture"
+            ),
+            uShowSsaoDebug: gl.getUniformLocation(
+              shaderProgram,
+              "uShowSsaoDebug"
+            ),
+          },
+        };
+
+        couchBuffers = initBuffers(gl, couchModelData);
+        if (aircraftData) {
+          aircraftBuffers = initBuffers(gl, aircraftData);
+        }
+        if (guitarData) {
+          guitarBuffers = initBuffers(gl, guitarData);
+        }
+        groundBuffers = initGroundPlaneBuffers(gl);
+        if (!groundBuffers) {
+          console.error("Ground plane buffer init failed.");
+        }
+
+        const quadVertices = new Float32Array([
+          -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0,
+        ]);
+        quadVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+
+        then = 0;
+        function render(now) {
+          now *= 0.001;
+          const deltaTime = now - then;
+          then = now;
+          objectRotation += deltaTime * 0.1;
+          drawScene(
+            gl,
+            programInfo,
+            gBufferProgramInfo,
+            ssaoProgramInfo,
+            ssaoBlurProgramInfo
+          );
+          requestAnimationFrame(render);
+        }
+        requestAnimationFrame(render);
+      }
+
+      document.addEventListener("DOMContentLoaded", main);
+
+      function initShaderProgram(gl, vsSrc, fsSrc) {
+        const vS = loadShader(gl, gl.VERTEX_SHADER, vsSrc);
+        const fS = loadShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+        if (!vS || !fS) return null;
+        const p = gl.createProgram();
+        gl.attachShader(p, vS);
+        gl.attachShader(p, fS);
+        gl.linkProgram(p);
+        if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+          console.error("Link fail:" + gl.getProgramInfoLog(p));
+          return null;
+        }
+        return p;
+      }
+      function loadShader(gl, type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+          console.error(
+            "Compile err(" +
+              (type == gl.VERTEX_SHADER ? "VS" : "FS") +
+              "):" +
+              gl.getShaderInfoLog(s)
+          );
+          gl.deleteShader(s);
+          return null;
+        }
+        return s;
+      }
+      function initBuffers(gl, modelData) {
+        if (
+          !modelData ||
+          !modelData.positions ||
+          modelData.positions.length === 0
+        )
+          return null;
+        const pB = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, pB);
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          new Float32Array(modelData.positions),
+          gl.STATIC_DRAW
+        );
+        const nB = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, nB);
+        if (
+          modelData.normals &&
+          modelData.normals.length > 0 &&
+          modelData.normals.length === modelData.positions.length
+        ) {
+          gl.bufferData(
+            gl.ARRAY_BUFFER,
+            new Float32Array(modelData.normals),
+            gl.STATIC_DRAW
+          );
+        } else {
+          console.warn("Normals invalid/fallback.");
+          const fN = new Float32Array(modelData.positions.length);
+          for (let i = 0; i < fN.length; i += 3) {
+            fN[i] = 0;
+            fN[i + 1] = 1;
+            fN[i + 2] = 0;
+          }
+          gl.bufferData(gl.ARRAY_BUFFER, fN, gl.STATIC_DRAW);
+        }
+        const tCB = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, tCB);
+        if (
+          modelData.texcoords &&
+          modelData.texcoords.length > 0 &&
+          modelData.texcoords.length / 2 === modelData.positions.length / 3
+        ) {
+          gl.bufferData(
+            gl.ARRAY_BUFFER,
+            new Float32Array(modelData.texcoords),
+            gl.STATIC_DRAW
+          );
+        } else {
+          console.warn("Texcoords invalid/fallback.");
+          const fTC = new Float32Array((modelData.positions.length / 3) * 2);
+          gl.bufferData(gl.ARRAY_BUFFER, fTC, gl.STATIC_DRAW);
+        }
+        console.log("initBuffers done.Verts:", modelData.positions.length / 3);
+        return {
+          position: pB,
+          normal: nB,
+          textureCoord: tCB,
+          vertexCount: modelData.positions.length / 3,
+        };
+      }
+
+      function drawScene(
+        gl,
+        mainProgramInfo,
+        gBufferProgInfo,
+        ssaoProgInfo,
+        ssaoBlurProgInfo
+      ) {
+        frameCount++;
+        if (frameCount % 60 === 0) {
+          console.log(
+            `drawScene Frame: ${frameCount}, CamDist: ${cameraDistance.toFixed(
+              2
+            )}, CamAngleX: ${cameraAngleX.toFixed(
+              2
+            )}, CamAngleY: ${cameraAngleY.toFixed(2)}`
+          );
+        }
+
+        const drawObjectToGBuffer = (
+          modelBuffers,
+          modelMatrix,
+          useIndices = false
+        ) => {
+          if (!modelBuffers) return;
+          const nM = glMatrix.mat4.create();
+          glMatrix.mat4.invert(nM, modelMatrix);
+          glMatrix.mat4.transpose(nM, nM);
+          gl.uniformMatrix4fv(
+            gBufferProgInfo.uniformLocations.modelMatrix,
+            false,
+            modelMatrix
+          );
+          gl.uniformMatrix4fv(
+            gBufferProgInfo.uniformLocations.normalMatrix,
+            false,
+            nM
+          );
+          gl.bindBuffer(gl.ARRAY_BUFFER, modelBuffers.position);
+          gl.vertexAttribPointer(
+            gBufferProgInfo.attribLocations.vertexPosition,
+            3,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(
+            gBufferProgInfo.attribLocations.vertexPosition
+          );
+          gl.bindBuffer(gl.ARRAY_BUFFER, modelBuffers.normal);
+          gl.vertexAttribPointer(
+            gBufferProgInfo.attribLocations.vertexNormal,
+            3,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(
+            gBufferProgInfo.attribLocations.vertexNormal
+          );
+          if (modelBuffers.vertexCount > 0) {
+            if (useIndices && modelBuffers.indices) {
+              gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, modelBuffers.indices);
+              gl.drawElements(
+                gl.TRIANGLES,
+                modelBuffers.vertexCount,
+                gl.UNSIGNED_SHORT,
+                0
+              );
+            } else {
+              gl.drawArrays(gl.TRIANGLES, 0, modelBuffers.vertexCount);
+            }
+          }
+        };
+
+        const drawObjectMainPass = (
+          modelBuffers,
+          modelTexture,
+          modelMatrix,
+          useIndices = false
+        ) => {
+          if (
+            !modelBuffers ||
+            (!modelTexture &&
+              currentRenderMode === "textured" &&
+              !showSsaoDebug)
+          ) {
+            if (!modelBuffers)
+              console.warn("drawObjectMainPass: modelBuffers missing");
+            if (
+              !modelTexture &&
+              currentRenderMode === "textured" &&
+              !showSsaoDebug
+            )
+              console.warn(
+                "drawObjectMainPass: modelTexture missing for textured mode"
+              );
+            return;
+          }
+          const nM = glMatrix.mat4.create();
+          glMatrix.mat4.invert(nM, modelMatrix);
+          glMatrix.mat4.transpose(nM, nM);
+          gl.bindBuffer(gl.ARRAY_BUFFER, modelBuffers.position);
+          gl.vertexAttribPointer(
+            mainProgramInfo.attribLocations.vertexPosition,
+            3,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(
+            mainProgramInfo.attribLocations.vertexPosition
+          );
+          gl.bindBuffer(gl.ARRAY_BUFFER, modelBuffers.normal);
+          gl.vertexAttribPointer(
+            mainProgramInfo.attribLocations.vertexNormal,
+            3,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(
+            mainProgramInfo.attribLocations.vertexNormal
+          );
+          gl.bindBuffer(gl.ARRAY_BUFFER, modelBuffers.textureCoord);
+          gl.vertexAttribPointer(
+            mainProgramInfo.attribLocations.textureCoord,
+            2,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(
+            mainProgramInfo.attribLocations.textureCoord
+          );
+          gl.uniformMatrix4fv(
+            mainProgramInfo.uniformLocations.modelMatrix,
+            false,
+            modelMatrix
+          );
+          gl.uniformMatrix4fv(
+            mainProgramInfo.uniformLocations.normalMatrix,
+            false,
+            nM
+          );
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, modelTexture);
+          gl.uniform1i(mainProgramInfo.uniformLocations.uSampler, 0);
+          if (useIndices && modelBuffers.indices) {
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, modelBuffers.indices);
+            gl.drawElements(
+              drawMode,
+              modelBuffers.vertexCount,
+              gl.UNSIGNED_SHORT,
+              0
+            );
+          } else {
+            if (modelBuffers.vertexCount > 0) {
+              gl.drawArrays(drawMode, 0, modelBuffers.vertexCount);
+            }
+          }
+        };
+
+        const fieldOfView = (45 * Math.PI) / 180;
+        const aspect = gl.canvas.clientWidth / gl.canvas.clientHeight;
+        const zNear = 0.1;
+        const zFar = 2000.0;
+        const projectionMatrix = glMatrix.mat4.create();
+        glMatrix.mat4.perspective(
+          projectionMatrix,
+          fieldOfView,
+          aspect,
+          zNear,
+          zFar
+        );
+        cameraPosition[0] =
+          cameraDistance * Math.sin(cameraAngleX) * Math.cos(cameraAngleY);
+        cameraPosition[1] = cameraDistance * Math.sin(cameraAngleY);
+        cameraPosition[2] =
+          cameraDistance * Math.cos(cameraAngleX) * Math.cos(cameraAngleY);
+        const viewMatrix = glMatrix.mat4.create();
+        glMatrix.mat4.lookAt(viewMatrix, cameraPosition, [0, 0, 0], [0, 1, 0]);
+
+        //  1. G-BUFFER PASS
+        if (gBufferFBO && gBufferProgInfo) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, gBufferFBO);
+          gl.viewport(0, 0, GBUFFER_WIDTH, GBUFFER_HEIGHT);
+          gl.clearColor(0, 0, 0, 1);
+          gl.clearDepth(1);
+          gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+          gl.enable(gl.DEPTH_TEST);
+          gl.depthFunc(gl.LEQUAL);
+          gl.useProgram(gBufferProgInfo.program);
+          gl.uniformMatrix4fv(
+            gBufferProgInfo.uniformLocations.projectionMatrix,
+            false,
+            projectionMatrix
+          );
+          gl.uniformMatrix4fv(
+            gBufferProgInfo.uniformLocations.viewMatrix,
+            false,
+            viewMatrix
+          );
+
+          if (couchBuffers) {
+            const m = glMatrix.mat4.create();
+            glMatrix.mat4.scale(m, m, [0.001, 0.001, 0.001]);
+            drawObjectToGBuffer(couchBuffers, m);
+          }
+          if (aircraftBuffers) {
+            const m = glMatrix.mat4.create();
+            glMatrix.mat4.translate(m, m, [0, 1, 1]);
+            glMatrix.mat4.scale(m, m, [0.1, 0.1, 0.1]);
+            glMatrix.mat4.rotate(m, m, objectRotation, [0, 1, 0]);
+            drawObjectToGBuffer(aircraftBuffers, m);
+          }
+          if (guitarBuffers) {
+            const m = glMatrix.mat4.create();
+            glMatrix.mat4.translate(m, m, [0.0, 1.3, 0.2]);
+            const s = 0.15;
+            glMatrix.mat4.scale(m, m, [s, s, s]);
+            glMatrix.mat4.rotate(m, m, Math.PI / 4, [0, 0, 1]);
+            drawObjectToGBuffer(guitarBuffers, m);
+          }
+          if (groundBuffers) {
+            const groundModelMatrix = glMatrix.mat4.create();
+            glMatrix.mat4.translate(
+              groundModelMatrix,
+              groundModelMatrix,
+              [0, 0.03, 0]
+            );
+            glMatrix.mat4.scale(
+              groundModelMatrix,
+              groundModelMatrix,
+              [15, 1, 15]
+            );
+            drawObjectToGBuffer(groundBuffers, groundModelMatrix, true);
+          }
+        }
+
+        //  2. SSAO CALCULATION PASS
+        if (
+          ssaoFBO &&
+          ssaoProgramInfo &&
+          gBufferNormalTexture &&
+          gBufferDepthTexture &&
+          ssaoNoiseTexture
+        ) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, ssaoFBO);
+          gl.viewport(0, 0, GBUFFER_WIDTH, GBUFFER_HEIGHT);
+          gl.clearColor(1, 1, 1, 1);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.useProgram(ssaoProgramInfo.program);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, gBufferDepthTexture);
+          gl.uniform1i(ssaoProgramInfo.uniformLocations.uGDepth, 0);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, gBufferNormalTexture);
+          gl.uniform1i(ssaoProgramInfo.uniformLocations.uGNormal, 1);
+          gl.activeTexture(gl.TEXTURE2);
+          gl.bindTexture(gl.TEXTURE_2D, ssaoNoiseTexture);
+          gl.uniform1i(ssaoProgramInfo.uniformLocations.uNoiseTexture, 2);
+          gl.uniformMatrix4fv(
+            ssaoProgramInfo.uniformLocations.uProjectionMatrix,
+            false,
+            projectionMatrix
+          );
+          gl.uniform3fv(
+            ssaoProgramInfo.uniformLocations.uKernel,
+            new Float32Array(ssaoKernel)
+          );
+          gl.uniform2f(
+            ssaoProgramInfo.uniformLocations.uScreenSize,
+            GBUFFER_WIDTH,
+            GBUFFER_HEIGHT
+          );
+          gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+          gl.vertexAttribPointer(
+            ssaoProgramInfo.attribLocations.position,
+            2,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(ssaoProgramInfo.attribLocations.position);
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        //  3. SSAO BLUR PASS
+        if (ssaoBlurFBO && ssaoBlurProgramInfo && ssaoTexture) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, ssaoBlurFBO);
+          gl.viewport(0, 0, GBUFFER_WIDTH, GBUFFER_HEIGHT);
+          gl.clearColor(1.0, 1.0, 1.0, 1.0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+
+          gl.useProgram(ssaoBlurProgramInfo.program);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, ssaoTexture);
+          gl.uniform1i(ssaoBlurProgramInfo.uniformLocations.uSsaoInput, 0);
+          gl.uniform2f(
+            ssaoBlurProgramInfo.uniformLocations.uTexelSize,
+            1.0 / GBUFFER_WIDTH,
+            1.0 / GBUFFER_HEIGHT
+          );
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+          gl.vertexAttribPointer(
+            ssaoBlurProgramInfo.attribLocations.position,
+            2,
+            gl.FLOAT,
+            false,
+            0,
+            0
+          );
+          gl.enableVertexAttribArray(
+            ssaoBlurProgramInfo.attribLocations.position
+          );
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        //  4. LIGHTING PASS (Main Render to Canvas)
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+        gl.clearColor(0.1, 0.1, 0.1, 1.0);
+        gl.clearDepth(1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+
+        gl.useProgram(mainProgramInfo.program);
+        gl.uniformMatrix4fv(
+          mainProgramInfo.uniformLocations.projectionMatrix,
+          false,
+          projectionMatrix
+        );
+        gl.uniformMatrix4fv(
+          mainProgramInfo.uniformLocations.viewMatrix,
+          false,
+          viewMatrix
+        );
+        const lightDirFromSource = [1.0, -1.0, -0.8];
+        gl.uniform3fv(
+          mainProgramInfo.uniformLocations.uLightDirectionWorld,
+          glMatrix.vec3.normalize(glMatrix.vec3.create(), lightDirFromSource)
+        );
+        gl.uniform3fv(
+          mainProgramInfo.uniformLocations.uCameraPositionWorld,
+          cameraPosition
+        );
+        gl.uniform3fv(
+          mainProgramInfo.uniformLocations.uLightColor,
+          [1.0, 1.0, 1.0]
+        );
+        gl.uniform3fv(
+          mainProgramInfo.uniformLocations.uAmbientColor,
+          [0.3, 0.3, 0.3]
+        );
+        gl.uniform3fv(
+          mainProgramInfo.uniformLocations.uSpecularColor,
+          [1.0, 1.0, 1.0]
+        );
+        gl.uniform1f(mainProgramInfo.uniformLocations.uShininess, 32.0);
+        gl.uniform1i(
+          mainProgramInfo.uniformLocations.uWireframe,
+          currentRenderMode === "wireframe" ? 1 : 0
+        );
+        gl.uniform1i(
+          mainProgramInfo.uniformLocations.uShowSsaoDebug,
+          showSsaoDebug ? 1 : 0
+        );
+
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, ssaoBlurTexture);
+        gl.uniform1i(mainProgramInfo.uniformLocations.uSsaoTexture, 1);
+
+        const drawMode =
+          currentRenderMode === "wireframe" ? gl.LINES : gl.TRIANGLES;
+
+        if (couchBuffers && couchTexture) {
+          const m = glMatrix.mat4.create();
+          glMatrix.mat4.scale(m, m, [0.001, 0.001, 0.001]);
+          drawObjectMainPass(couchBuffers, couchTexture, m);
+        }
+        if (aircraftBuffers && aircraftTexture) {
+          const m = glMatrix.mat4.create();
+          glMatrix.mat4.translate(m, m, [0, 1, 1]);
+          glMatrix.mat4.scale(m, m, [0.1, 0.1, 0.1]);
+          glMatrix.mat4.rotate(m, m, objectRotation, [0, 1, 0]);
+          drawObjectMainPass(aircraftBuffers, aircraftTexture, m);
+        }
+        if (guitarBuffers && guitarTexture) {
+          const m = glMatrix.mat4.create();
+          glMatrix.mat4.translate(m, m, [0.0, 1.3, 0.2]);
+          const s = 0.15;
+          glMatrix.mat4.scale(m, m, [s, s, s]);
+          glMatrix.mat4.rotate(m, m, Math.PI / 4, [0, 0, 1]);
+          drawObjectMainPass(guitarBuffers, guitarTexture, m);
+        }
+        if (groundBuffers && groundTexture) {
+          const groundModelMatrix = glMatrix.mat4.create();
+          glMatrix.mat4.translate(
+            groundModelMatrix,
+            groundModelMatrix,
+            [0, 0.03, 0]
+          );
+          glMatrix.mat4.scale(
+            groundModelMatrix,
+            groundModelMatrix,
+            [15, 1, 15]
+          );
+          drawObjectMainPass(
+            groundBuffers,
+            groundTexture,
+            groundModelMatrix,
+            true
+          );
+        }
+      }
+      document.addEventListener("DOMContentLoaded", main);
+    </script>
+  </body>
+</html>
